@@ -5,4 +5,5 @@ Instructions
 4. create virtual python env, python -m venv venv
 5. on project path, venv\Scripts\activate
 6. run pip install -r requirements.txt
-7. run uvicorn app:app
+7. open Metatrader 5 on Windows, Login to trading account correctly
+8. run uvicorn app:app
