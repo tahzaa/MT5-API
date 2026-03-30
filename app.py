@@ -99,10 +99,11 @@ class OHLCResponse(BaseModel):
     data: List[OHLCBar]
 
 
-def _build_s1_bars(symbol: str, bars: int) -> List[OHLCBar]:
+def _build_s1_bars(symbol: str, bars: int, date_from: Optional[datetime] = None) -> List[OHLCBar]:
     """Build 1-second OHLC bars by aggregating raw tick data from MT5."""
-    date_from = datetime.now() - timedelta(seconds=bars + 120)
-    ticks = mt5.copy_ticks_from(symbol, date_from, 500000, mt5.COPY_TICKS_ALL)
+    shifted = date_from is not None
+    fetch_from = date_from if shifted else datetime.now() - timedelta(seconds=bars + 120)
+    ticks = mt5.copy_ticks_from(symbol, fetch_from, 500000, mt5.COPY_TICKS_ALL)
     if ticks is None or len(ticks) == 0:
         return []
 
@@ -146,6 +147,9 @@ def _build_s1_bars(symbol: str, bars: int) -> List[OHLCBar]:
             real_volume=total_volume
         ))
 
+    # When shift is given, take bars forward from that point; otherwise take the latest bars
+    if shifted:
+        return result[:bars]
     return result[-bars:] if len(result) > bars else result
 
 
@@ -179,7 +183,8 @@ async def root():
 async def get_ohlc(
     symbol: str = Query(..., description="Trading symbol (e.g., EURUSD, GBPUSD)"),
     timeframe: TimeFrame = Query(..., description="Timeframe (M1, M5, H1, D1, etc.)"),
-    bars: int = Query(100, ge=1, le=5000, description="Number of bars to retrieve (1-5000)")
+    bars: int = Query(100, ge=1, le=5000, description="Number of bars to retrieve (1-5000)"),
+    shift: Optional[datetime] = Query(None, description="Start datetime for history (ISO 8601, e.g. 2026-03-29T10:00:00). Omit for latest bars.")
 ):
 
     if not mt5.terminal_info():
@@ -189,12 +194,13 @@ async def get_ohlc(
         )
 
     if timeframe == TimeFrame.S1:
-        ohlc_data = _build_s1_bars(symbol, bars)
+        ohlc_data = _build_s1_bars(symbol, bars, date_from=shift)
         if not ohlc_data:
             raise HTTPException(
                 status_code=404,
                 detail=f"No tick data available for {symbol} to build S1 bars"
             )
+        ohlc_data.sort(key=lambda b: b.time, reverse=True)
     else:
         mt5_timeframe = TIMEFRAME_MAP.get(timeframe.value)
         if not mt5_timeframe:
@@ -203,7 +209,11 @@ async def get_ohlc(
                 detail=f"Invalid timeframe: {timeframe}"
             )
 
-        rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
+        rates = (
+            mt5.copy_rates_from(symbol, mt5_timeframe, shift, bars)
+            if shift is not None
+            else mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
+        )
         if rates is None:
             error = mt5.last_error()
             raise HTTPException(
@@ -217,9 +227,8 @@ async def get_ohlc(
                 detail=f"No data available for symbol {symbol} on timeframe {timeframe}"
             )
 
-        ohlc_data = []
-        for rate in rates:
-            ohlc_data.append(OHLCBar(
+        ohlc_data = [
+            OHLCBar(
                 time=datetime.fromtimestamp(rate['time']).isoformat(),
                 open=float(rate['open']),
                 high=float(rate['high']),
@@ -228,7 +237,10 @@ async def get_ohlc(
                 tick_volume=int(rate['tick_volume']),
                 spread=int(rate['spread']),
                 real_volume=int(rate['real_volume'])
-            ))
+            )
+            for rate in rates
+        ]
+        ohlc_data.sort(key=lambda b: b.time, reverse=True)
 
     return OHLCResponse(
         symbol=symbol,
