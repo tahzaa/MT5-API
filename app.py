@@ -3,16 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import defaultdict
 import MetaTrader5 as mt5
 from enum import Enum
 import asyncio
 import json
+import os
 
 # MT5 Connection configuration
-MT5_ACCOUNT = 12345678
-MT5_PASSWORD = "your_password"
-MT5_SERVER = "your_trading_server"
+MT5_ACCOUNT = os.environ.get("MT5_ACCOUNT")
+MT5_PASSWORD = os.environ.get("MT5_PASSWORD")
+MT5_SERVER = os.environ.get("MT5_SERVER")
 
 app = FastAPI()
 
@@ -27,6 +29,7 @@ app.add_middleware(
 
 class TimeFrame(str, Enum):
     """MT5 Timeframe enumeration"""
+    S1 = "S1"
     M1 = "M1"
     M2 = "M2"
     M3 = "M3"
@@ -96,6 +99,56 @@ class OHLCResponse(BaseModel):
     data: List[OHLCBar]
 
 
+def _build_s1_bars(symbol: str, bars: int) -> List[OHLCBar]:
+    """Build 1-second OHLC bars by aggregating raw tick data from MT5."""
+    date_from = datetime.now() - timedelta(seconds=bars + 120)
+    ticks = mt5.copy_ticks_from(symbol, date_from, 500000, mt5.COPY_TICKS_ALL)
+    if ticks is None or len(ticks) == 0:
+        return []
+
+    symbol_info = mt5.symbol_info(symbol)
+    point = symbol_info.point if symbol_info and symbol_info.point > 0 else 0.00001
+
+    buckets: dict = defaultdict(list)
+    for tick in ticks:
+        second_ts = int(tick['time_msc']) // 1000
+        buckets[second_ts].append(tick)
+
+    result: List[OHLCBar] = []
+    for second_ts in sorted(buckets.keys()):
+        bucket = buckets[second_ts]
+        prices = []
+        spreads = []
+        total_volume = 0
+
+        for t in bucket:
+            bid, ask = float(t['bid']), float(t['ask'])
+            if bid > 0:
+                prices.append(bid)
+            elif ask > 0:
+                prices.append(ask)
+            if bid > 0 and ask > 0:
+                spreads.append(ask - bid)
+            total_volume += int(t['volume'])
+
+        if not prices:
+            continue
+
+        avg_spread = sum(spreads) / len(spreads) if spreads else 0.0
+        result.append(OHLCBar(
+            time=datetime.fromtimestamp(second_ts).isoformat(),
+            open=prices[0],
+            high=max(prices),
+            low=min(prices),
+            close=prices[-1],
+            tick_volume=len(bucket),
+            spread=int(round(avg_spread / point)),
+            real_volume=total_volume
+        ))
+
+    return result[-bars:] if len(result) > bars else result
+
+
 @app.on_event("startup")
 async def startup_event():
     if not mt5.initialize():
@@ -135,39 +188,47 @@ async def get_ohlc(
             detail="MT5 terminal not connected. Please check connection."
         )
 
-    mt5_timeframe = TIMEFRAME_MAP.get(timeframe.value)
-    if not mt5_timeframe:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid timeframe: {timeframe}"
-        )
+    if timeframe == TimeFrame.S1:
+        ohlc_data = _build_s1_bars(symbol, bars)
+        if not ohlc_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No tick data available for {symbol} to build S1 bars"
+            )
+    else:
+        mt5_timeframe = TIMEFRAME_MAP.get(timeframe.value)
+        if not mt5_timeframe:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid timeframe: {timeframe}"
+            )
 
-    rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
-    if rates is None:
-        error = mt5.last_error()
-        raise HTTPException(
-            status_code=404,
-            detail=f"Failed to get data for {symbol}. Error: {error}"
-        )
+        rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
+        if rates is None:
+            error = mt5.last_error()
+            raise HTTPException(
+                status_code=404,
+                detail=f"Failed to get data for {symbol}. Error: {error}"
+            )
 
-    if len(rates) == 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No data available for symbol {symbol} on timeframe {timeframe}"
-        )
+        if len(rates) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No data available for symbol {symbol} on timeframe {timeframe}"
+            )
 
-    ohlc_data = []
-    for rate in rates:
-        ohlc_data.append(OHLCBar(
-            time=datetime.fromtimestamp(rate['time']).isoformat(),
-            open=float(rate['open']),
-            high=float(rate['high']),
-            low=float(rate['low']),
-            close=float(rate['close']),
-            tick_volume=int(rate['tick_volume']),
-            spread=int(rate['spread']),
-            real_volume=int(rate['real_volume'])
-        ))
+        ohlc_data = []
+        for rate in rates:
+            ohlc_data.append(OHLCBar(
+                time=datetime.fromtimestamp(rate['time']).isoformat(),
+                open=float(rate['open']),
+                high=float(rate['high']),
+                low=float(rate['low']),
+                close=float(rate['close']),
+                tick_volume=int(rate['tick_volume']),
+                spread=int(rate['spread']),
+                real_volume=int(rate['real_volume'])
+            ))
 
     return OHLCResponse(
         symbol=symbol,
