@@ -101,9 +101,13 @@ class OHLCResponse(BaseModel):
 
 def _build_s1_bars(symbol: str, bars: int, date_from: Optional[datetime] = None) -> List[OHLCBar]:
     """Build 1-second OHLC bars by aggregating raw tick data from MT5."""
-    shifted = date_from is not None
-    fetch_from = date_from if shifted else datetime.now() - timedelta(seconds=bars + 120)
-    ticks = mt5.copy_ticks_from(symbol, fetch_from, 500000, mt5.COPY_TICKS_ALL)
+    if date_from is not None:
+        # shift provided: look BACK from date_from into the past
+        fetch_from = date_from - timedelta(seconds=bars + 120)
+        ticks = mt5.copy_ticks_range(symbol, fetch_from, date_from, mt5.COPY_TICKS_ALL)
+    else:
+        fetch_from = datetime.now() - timedelta(seconds=bars + 120)
+        ticks = mt5.copy_ticks_from(symbol, fetch_from, 500000, mt5.COPY_TICKS_ALL)
     if ticks is None or len(ticks) == 0:
         return []
 
@@ -147,9 +151,6 @@ def _build_s1_bars(symbol: str, bars: int, date_from: Optional[datetime] = None)
             real_volume=total_volume
         ))
 
-    # When shift is given, take bars forward from that point; otherwise take the latest bars
-    if shifted:
-        return result[:bars]
     return result[-bars:] if len(result) > bars else result
 
 
@@ -183,7 +184,7 @@ async def root():
 async def get_ohlc(
     symbol: str = Query(..., description="Trading symbol (e.g., EURUSD, GBPUSD)"),
     timeframe: TimeFrame = Query(..., description="Timeframe (M1, M5, H1, D1, etc.)"),
-    bars: int = Query(100, ge=1, le=5000, description="Number of bars to retrieve (1-5000)"),
+    bars: int = Query(100, ge=1, le=500000, description="Number of bars to retrieve (1-500000)"),
     shift: Optional[datetime] = Query(None, description="Start datetime for history (ISO 8601, e.g. 2026-03-29T10:00:00). Omit for latest bars.")
 ):
 
@@ -200,7 +201,7 @@ async def get_ohlc(
                 status_code=404,
                 detail=f"No tick data available for {symbol} to build S1 bars"
             )
-        ohlc_data.sort(key=lambda b: b.time, reverse=True)
+        # ohlc_data.sort(key=lambda b: b.time, reverse=True)
     else:
         mt5_timeframe = TIMEFRAME_MAP.get(timeframe.value)
         if not mt5_timeframe:
@@ -240,7 +241,7 @@ async def get_ohlc(
             )
             for rate in rates
         ]
-        ohlc_data.sort(key=lambda b: b.time, reverse=True)
+        # ohlc_data.sort(key=lambda b: b.time, reverse=True)
 
     return OHLCResponse(
         symbol=symbol,
