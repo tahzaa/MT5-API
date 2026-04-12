@@ -2,8 +2,8 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime, timedelta
+from typing import List
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import MetaTrader5 as mt5
 from enum import Enum
@@ -81,7 +81,7 @@ TIMEFRAME_MAP = {
 
 class OHLCBar(BaseModel):
     """Single OHLC bar data"""
-    time: str
+    time: int
     open: float
     high: float
     low: float
@@ -99,15 +99,12 @@ class OHLCResponse(BaseModel):
     data: List[OHLCBar]
 
 
-def _build_s1_bars(symbol: str, bars: int, date_from: Optional[datetime] = None) -> List[OHLCBar]:
+def _build_s1_bars(symbol: str, date_from: datetime, date_to: datetime) -> List[OHLCBar]:
     """Build 1-second OHLC bars by aggregating raw tick data from MT5."""
-    if date_from is not None:
-        # shift provided: look BACK from date_from into the past
-        fetch_from = date_from - timedelta(seconds=bars + 120)
-        ticks = mt5.copy_ticks_range(symbol, fetch_from, date_from, mt5.COPY_TICKS_ALL)
-    else:
-        fetch_from = datetime.now() - timedelta(seconds=bars + 120)
-        ticks = mt5.copy_ticks_from(symbol, fetch_from, 500000, mt5.COPY_TICKS_ALL)
+    # Add buffer to ensure we get all ticks
+    fetch_from = date_from - timedelta(seconds=120)
+    ticks = mt5.copy_ticks_range(symbol, fetch_from, date_to, mt5.COPY_TICKS_ALL)
+
     if ticks is None or len(ticks) == 0:
         return []
 
@@ -140,18 +137,22 @@ def _build_s1_bars(symbol: str, bars: int, date_from: Optional[datetime] = None)
             continue
 
         avg_spread = sum(spreads) / len(spreads) if spreads else 0.0
-        result.append(OHLCBar(
-            time=datetime.fromtimestamp(second_ts).isoformat(),
-            open=prices[0],
-            high=max(prices),
-            low=min(prices),
-            close=prices[-1],
-            tick_volume=len(bucket),
-            spread=int(round(avg_spread / point)),
-            real_volume=total_volume
-        ))
+        bar_datetime = datetime.fromtimestamp(second_ts, tz=timezone.utc)
 
-    return result[-bars:] if len(result) > bars else result
+        # Only include bars within the requested range
+        if date_from <= bar_datetime <= date_to:
+            result.append(OHLCBar(
+                time=second_ts * 1000,  # Convert to milliseconds
+                open=prices[0],
+                high=max(prices),
+                low=min(prices),
+                close=prices[-1],
+                tick_volume=len(bucket),
+                spread=int(round(avg_spread / point)),
+                real_volume=total_volume
+            ))
+
+    return result
 
 
 @app.on_event("startup")
@@ -184,8 +185,8 @@ async def root():
 async def get_ohlc(
     symbol: str = Query(..., description="Trading symbol (e.g., EURUSD, GBPUSD)"),
     timeframe: TimeFrame = Query(..., description="Timeframe (M1, M5, H1, D1, etc.)"),
-    bars: int = Query(100, ge=1, le=500000, description="Number of bars to retrieve (1-500000)"),
-    shift: Optional[datetime] = Query(None, description="Start datetime for history (ISO 8601, e.g. 2026-03-29T10:00:00). Omit for latest bars.")
+    from_: int = Query(..., alias="from", description="Start time as UNIX timestamp in milliseconds (e.g., 1711713600000)"),
+    to: int = Query(..., description="End time as UNIX timestamp in milliseconds (e.g., 1711720800000)")
 ):
 
     if not mt5.terminal_info():
@@ -194,8 +195,12 @@ async def get_ohlc(
             detail="MT5 terminal not connected. Please check connection."
         )
 
+    # Convert UNIX timestamps (milliseconds) to datetime objects in UTC
+    from_dt = datetime.fromtimestamp(from_ / 1000, tz=timezone.utc)
+    to_dt = datetime.fromtimestamp(to / 1000, tz=timezone.utc)
+
     if timeframe == TimeFrame.S1:
-        ohlc_data = _build_s1_bars(symbol, bars, date_from=shift)
+        ohlc_data = _build_s1_bars(symbol, from_dt, to_dt)
         if not ohlc_data:
             raise HTTPException(
                 status_code=404,
@@ -210,11 +215,8 @@ async def get_ohlc(
                 detail=f"Invalid timeframe: {timeframe}"
             )
 
-        rates = (
-            mt5.copy_rates_from(symbol, mt5_timeframe, shift, bars)
-            if shift is not None
-            else mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
-        )
+        rates = mt5.copy_rates_range(symbol, mt5_timeframe, from_dt, to_dt)
+
         if rates is None:
             error = mt5.last_error()
             raise HTTPException(
@@ -230,7 +232,7 @@ async def get_ohlc(
 
         ohlc_data = [
             OHLCBar(
-                time=datetime.fromtimestamp(rate['time']).isoformat(),
+                time=int(rate['time']) * 1000,  # Convert to milliseconds
                 open=float(rate['open']),
                 high=float(rate['high']),
                 low=float(rate['low']),
@@ -373,7 +375,7 @@ async def websocket_realtime(websocket: WebSocket, symbol: str):
                 tick_data = {
                     "type": "tick",
                     "symbol": symbol,
-                    "time": datetime.fromtimestamp(tick.time).isoformat(),
+                    "time": datetime.fromtimestamp(tick.time, tz=timezone.utc).isoformat().replace('+00:00', 'Z'),
                     "time_msc": tick.time_msc,
                     "bid": tick.bid,
                     "ask": tick.ask,
